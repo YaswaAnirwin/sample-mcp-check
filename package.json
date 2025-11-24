@@ -1,15 +1,12 @@
 {
   "name": "sample-mcp-check",
   "displayName": "Sample MCP Test Extension",
-  "description": "A lightweight VS Code extension to verify that the global MCP server (instructions-remote-mcp) is loaded correctly and returns instruction files to Copilot Chat.",
+  "description": "A lightweight VS Code extension to verify MCP behavior",
   "version": "0.0.1",
   "publisher": "snap",
   "engines": {
     "vscode": "^1.90.0"
   },
-  "categories": [
-    "Other"
-  ],
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -23,7 +20,7 @@
       {
         "id": "snap",
         "name": "Snap",
-        "description": "MCP Instruction Loader Participant"
+        "description": "MCP test participant"
       }
     ]
   },

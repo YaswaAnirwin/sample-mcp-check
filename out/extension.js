@@ -38,54 +38,115 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const child_process_1 = require("child_process");
 /**
- * 🧩 Snap MCP Instruction Loader Test
- * Shows all markdown files fetched by the MCP before Copilot generation.
+ * Minimal MCP client for VS Code extension
  */
-function activate(context) {
-    const mcpPath = "C:/Users/DuddeYaswaAnirwin/snap-mcp-plugin/mcp/instructions-remote-mcp.mjs";
-    const loadedFiles = [];
-    let mcpOutput = "";
-    // --- 1️⃣ Start MCP server manually ---
-    const mcpProc = (0, child_process_1.spawn)("node", [mcpPath], { stdio: ["pipe", "pipe", "pipe"] });
-    const outChannel = vscode.window.createOutputChannel("Snap MCP Debug");
-    outChannel.show(true);
-    mcpProc.stdout.on("data", (d) => {
-        const text = d.toString();
-        mcpOutput += text;
-        outChannel.append(text);
-        // capture all "✅ Loaded:" lines within this chunk
-        for (const line of text.split(/\r?\n/)) {
-            const match = line.match(/✅\s+Loaded:\s*(.+)/);
-            if (match) {
-                const file = match[1].trim();
-                if (!loadedFiles.includes(file)) {
-                    loadedFiles.push(file);
+class MCPClient {
+    constructor(command, args) {
+        this.command = command;
+        this.args = args;
+        this.proc = null;
+        this.msgId = 1;
+        this.pending = new Map();
+    }
+    start(out) {
+        this.proc = (0, child_process_1.spawn)(this.command, this.args, {
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        this.proc.stdout.on("data", (data) => {
+            const text = data.toString();
+            out.appendLine("[MCP STDOUT] " + text);
+            // Parse JSON RPC safely
+            try {
+                const obj = JSON.parse(text);
+                if (obj.id && this.pending.has(obj.id)) {
+                    this.pending.get(obj.id)?.(obj);
+                    this.pending.delete(obj.id);
                 }
             }
+            catch {
+                // ignore non-JSON output
+            }
+        });
+        this.proc.stderr.on("data", (data) => {
+            out.appendLine("[MCP ERROR] " + data.toString());
+        });
+        this.proc.on("close", (code) => {
+            out.appendLine(`[MCP] exited with code ${code}`);
+        });
+    }
+    send(method, params = {}) {
+        return new Promise((resolve) => {
+            const id = this.msgId++;
+            const req = {
+                jsonrpc: "2.0",
+                id,
+                method,
+                params,
+            };
+            const json = JSON.stringify(req);
+            this.proc?.stdin.write(json + "\n");
+            this.pending.set(id, (resp) => {
+                resolve(resp.result);
+            });
+        });
+    }
+}
+/**
+ * VS Code Extension Activation
+ */
+function activate(context) {
+    const out = vscode.window.createOutputChannel("Snap MCP Debug");
+    out.show(true);
+    const mcpPath = "C:/Users/DuddeYaswaAnirwin/snap-mcp-plugin/mcp/instructions-remote-mcp.mjs";
+    const client = new MCPClient("node", [mcpPath]);
+    client.start(out);
+    // === Send initialize sequence ===
+    (async () => {
+        out.appendLine("➡️ Sending initialize...");
+        await client.send("initialize", {});
+        await client.send("initialized", {});
+        const tools = await client.send("tools/list", {});
+        out.appendLine("🧰 Tools discovered:");
+        for (const t of tools.tools)
+            out.appendLine(" - " + t.name);
+    })();
+    /**
+     * Chat participant: @snap
+     */
+    const participant = vscode.chat.createChatParticipant("snap", async (req, ctx, res) => {
+        const text = req.prompt.toLowerCase();
+        if (text.includes("list tools")) {
+            const tools = await client.send("tools/list", {});
+            res.markdown("### 🧰 Available Tools:");
+            res.markdown(tools.tools.map((t) => "- " + t.name).join("\n"));
+            return;
         }
-    });
-    mcpProc.stderr.on("data", (d) => {
-        outChannel.appendLine("[MCP Error] " + d.toString());
-    });
-    mcpProc.on("close", (code) => {
-        outChannel.appendLine(`[MCP] exited with code ${code}`);
-    });
-    // --- 2️⃣ Chat participant for @snap ---
-    const snapParticipant = vscode.chat.createChatParticipant("snap", async (request, chatCtx, response) => {
-        response.markdown("🧩 **Snap MCP Instruction Loader Active…**");
-        // small delay to allow late stdout lines to finish
-        await new Promise(r => setTimeout(r, 500));
-        if (loadedFiles.length > 0) {
-            response.markdown(`✅ **Files loaded into Copilot context:**\n\n${loadedFiles
-                .map(f => `- ${f}`)
-                .join("\n")}`);
+        if (text.includes("figma")) {
+            const outText = await client.send("tools/call", {
+                name: "getFigmaInstructions",
+                arguments: {},
+            });
+            res.markdown("### 🎨 Figma Instructions\n" + outText.content[0].text);
+            return;
         }
-        else {
-            response.markdown("⚠️ MCP is still loading or no files were detected. Check the 'Snap MCP Debug' output.");
+        if (text.includes("azure") || text.includes("pbi")) {
+            const outText = await client.send("tools/call", {
+                name: "getAzureDevOpsInstructions",
+                arguments: {},
+            });
+            res.markdown("### 🔷 Azure DevOps Instructions\n" + outText.content[0].text);
+            return;
         }
-        response.markdown(`🕒 Last update: ${new Date().toLocaleTimeString()}`);
+        if (text.includes("ui")) {
+            const outText = await client.send("tools/call", {
+                name: "getUIComponentInstructions",
+                arguments: {},
+            });
+            res.markdown("### 🧩 UI Instructions\n" + outText.content[0].text);
+            return;
+        }
+        res.markdown("I can run MCP tools. Try:\n- list tools\n- figma link\n- azure pbi\n- load ui instructions");
     });
-    context.subscriptions.push(snapParticipant);
-    context.subscriptions.push({ dispose: () => mcpProc.kill() });
+    context.subscriptions.push(participant);
 }
 function deactivate() { }
