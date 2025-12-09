@@ -4,11 +4,13 @@
   "description": "A lightweight VS Code extension to verify MCP behavior",
   "version": "0.0.1",
   "publisher": "snap",
+  "type": "commonjs",
   "engines": {
     "vscode": "^1.90.0"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onChatParticipant:snap"
   ],
   "main": "./out/extension.js",
   "scripts": {
@@ -20,7 +22,7 @@
       {
         "id": "snap",
         "name": "Snap",
-        "description": "MCP test participant"
+        "description": "Smart MCP participant for Figma / ADO / UI"
       }
     ]
   },

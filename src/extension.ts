@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 
+/* ---------------------------------------------------------
+   JSON-RPC Types
+--------------------------------------------------------- */
 interface MCPRequest {
   jsonrpc: string;
   id: number;
@@ -15,13 +18,15 @@ interface MCPResponse {
   error?: any;
 }
 
-/**
- * Minimal MCP client for VS Code extension
- */
+/* ---------------------------------------------------------
+   Minimal JSON-RPC MCP client
+--------------------------------------------------------- */
 class MCPClient {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private msgId = 1;
   private pending: Map<number, (resp: MCPResponse) => void> = new Map();
+
+  private buffer = ""; // <- CRITICAL FIX
 
   constructor(private command: string, private args: string[]) {}
 
@@ -30,19 +35,31 @@ class MCPClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    /* ---------------------------------------------------------
+       FIXED JSON PARSER
+       Reads stdout line-by-line so JSON never breaks
+    --------------------------------------------------------- */
     this.proc.stdout.on("data", (data: Buffer) => {
-      const text = data.toString();
-      out.appendLine("[MCP STDOUT] " + text);
+      this.buffer += data.toString();
 
-      // Parse JSON RPC safely
-      try {
-        const obj = JSON.parse(text) as MCPResponse;
-        if (obj.id && this.pending.has(obj.id)) {
-          this.pending.get(obj.id)?.(obj);
-          this.pending.delete(obj.id);
+      let idx;
+      while ((idx = this.buffer.indexOf("\n")) >= 0) {
+        const line = this.buffer.slice(0, idx).trim();
+        this.buffer = this.buffer.slice(idx + 1);
+
+        if (!line) continue;
+        out.appendLine("[MCP STDOUT] " + line);
+
+        try {
+          const obj = JSON.parse(line) as MCPResponse;
+
+          if (obj.id && this.pending.has(obj.id)) {
+            this.pending.get(obj.id)?.(obj);
+            this.pending.delete(obj.id);
+          }
+        } catch {
+          // ignore non-JSON lines
         }
-      } catch {
-        // ignore non-JSON output
       }
     });
 
@@ -58,26 +75,16 @@ class MCPClient {
   send(method: string, params: any = {}): Promise<any> {
     return new Promise((resolve) => {
       const id = this.msgId++;
-      const req: MCPRequest = {
-        jsonrpc: "2.0",
-        id,
-        method,
-        params,
-      };
-
-      const json = JSON.stringify(req);
-      this.proc?.stdin.write(json + "\n");
-
-      this.pending.set(id, (resp: MCPResponse) => {
-        resolve(resp.result);
-      });
+      const req: MCPRequest = { jsonrpc: "2.0", id, method, params };
+      this.proc?.stdin.write(JSON.stringify(req) + "\n");
+      this.pending.set(id, (resp: MCPResponse) => resolve(resp.result));
     });
   }
 }
 
-/**
- * VS Code Extension Activation
- */
+/* ---------------------------------------------------------
+   VS Code Extension Activation
+--------------------------------------------------------- */
 export function activate(context: vscode.ExtensionContext) {
   const out = vscode.window.createOutputChannel("Snap MCP Debug");
   out.show(true);
@@ -88,63 +95,175 @@ export function activate(context: vscode.ExtensionContext) {
   const client = new MCPClient("node", [mcpPath]);
   client.start(out);
 
-  // === Send initialize sequence ===
+  // Initialize MCP
   (async () => {
     out.appendLine("➡️ Sending initialize...");
     await client.send("initialize", {});
     await client.send("initialized", {});
     const tools = await client.send("tools/list", {});
-
     out.appendLine("🧰 Tools discovered:");
     for (const t of tools.tools) out.appendLine(" - " + t.name);
   })();
 
-  /**
-   * Chat participant: @snap
-   */
+  /* ---------------------------------------------------------
+     VS Code Chat Participant
+  --------------------------------------------------------- */
   const participant = vscode.chat.createChatParticipant(
     "snap",
-    async (req, ctx, res) => {
-      const text = req.prompt.toLowerCase();
+    async (req, ctx, response) => {
+      response.markdown("⏳ Loading instructions...");
+      const userPrompt = req.prompt.toLowerCase();
 
-      if (text.includes("list tools")) {
+      /* ---------------------------------------------------------
+         Tool listing for debugging
+      --------------------------------------------------------- */
+      if (userPrompt.includes("list tools") || userPrompt.includes("show tools")) {
         const tools = await client.send("tools/list", {});
-        res.markdown("### 🧰 Available Tools:");
-        res.markdown(tools.tools.map((t: any) => "- " + t.name).join("\n"));
+        response.markdown("### 🧰 Available Tools:");
+        response.markdown(tools.tools.map((t: any) => "- " + t.name).join("\n"));
         return;
       }
 
-      if (text.includes("figma")) {
-        const outText = await client.send("tools/call", {
-          name: "getFigmaInstructions",
+      /* ---------------------------------------------------------
+         Detect specific instruction tool
+      --------------------------------------------------------- */
+      let specificToolName = "";
+      if (userPrompt.includes("figma")) {
+        specificToolName = "getFigmaInstructions";
+      } else if (
+        userPrompt.includes("azure") ||
+        userPrompt.includes("dev.azure.com") ||
+        userPrompt.includes("pbi")
+      ) {
+        specificToolName = "getAzureDevOpsInstructions";
+      } else if (
+        userPrompt.includes("ui") ||
+        userPrompt.includes("saffron") ||
+        userPrompt.includes("react")
+      ) {
+        specificToolName = "getUIComponentInstructions";
+      }
+
+      out.appendLine(`[DEBUG] Detected tool: ${specificToolName || "none"}`);
+
+      /* ---------------------------------------------------------
+         Load auto-detected instructions
+      --------------------------------------------------------- */
+      out.appendLine("[DEBUG] Calling detectAndLoadInstructions...");
+      const detect = await client.send("tools/call", {
+        name: "detectAndLoadInstructions",
+        arguments: { query: req.prompt },
+      });
+
+      /* ---------------------------------------------------------
+         Load specific instructions if required
+      --------------------------------------------------------- */
+      let specificInstructions = null;
+      if (specificToolName) {
+        out.appendLine(`[DEBUG] Calling ${specificToolName}...`);
+        specificInstructions = await client.send("tools/call", {
+          name: specificToolName,
           arguments: {},
         });
+      }
 
-        res.markdown("### 🎨 Figma Instructions\n" + outText.content[0].text);
+      /* ---------------------------------------------------------
+         Show visible messages (file list)
+      --------------------------------------------------------- */
+      const visible = detect?.content?.find((c: any) => c.type === "text");
+      if (visible) response.markdown(visible.text);
+
+      const specificVisible = specificInstructions?.content?.find(
+        (c: any) => c.type === "text"
+      );
+      if (specificVisible) response.markdown(specificVisible.text);
+
+      /* ---------------------------------------------------------
+         Extract HIDDEN instruction content (CRITICAL FIX)
+      --------------------------------------------------------- */
+      const hiddenDetect =
+        detect?.content?.filter((c: any) => c.type === "copilot_context") || [];
+
+      const hiddenSpecific =
+        specificInstructions?.content?.filter(
+          (c: any) => c.type === "copilot_context"
+        ) || [];
+
+      const allHiddenInstructions = [...hiddenDetect, ...hiddenSpecific];
+
+      let combinedInstructions = "";
+
+      for (const instr of allHiddenInstructions) {
+        if (instr.type === "copilot_context" && instr.data) {
+          combinedInstructions += instr.data + "\n\n"; // FIXED
+        }
+      }
+
+      /* ---------------------------------------------------------
+         Combine instructions + user request
+      --------------------------------------------------------- */
+      const MAX_CHARS = 20000;
+      const safeCombined =
+        combinedInstructions.length > MAX_CHARS
+          ? combinedInstructions.slice(0, MAX_CHARS) + "\n\n[...truncated...]"
+          : combinedInstructions;
+
+      const finalPrompt = safeCombined
+        ? `${safeCombined}\n\nUser Request: ${req.prompt}`
+        : req.prompt;
+
+      /* ---------------------------------------------------------
+         Select Language Model (stabilized 10s timeout)
+      --------------------------------------------------------- */
+      const selectWithTimeout = (selector: any, timeoutMs: number) =>
+        Promise.race([
+          vscode.lm.selectChatModels(selector),
+          new Promise<any[]>((_, reject) =>
+            setTimeout(() => reject(new Error("Model selection timed out")), timeoutMs)
+          ),
+        ]);
+
+      let models: vscode.LanguageModelChat[] = [];
+      try {
+        models = await selectWithTimeout({ family: "gpt-4o" }, 10000);
+      } catch {
+        models = await selectWithTimeout({}, 10000).catch(() => []);
+      }
+
+      if (models.length === 0) {
+        response.markdown("\n⚠️ No language model available.");
         return;
       }
 
-      if (text.includes("azure") || text.includes("pbi")) {
-        const outText = await client.send("tools/call", {
-          name: "getAzureDevOpsInstructions",
-          arguments: {},
-        });
+      /* ---------------------------------------------------------
+         Send final prompt to language model
+      --------------------------------------------------------- */
+      const model = models[0];
+      response.markdown("\n---\n### 🤖 Generated Response:\n\n");
 
-        res.markdown("### 🔷 Azure DevOps Instructions\n" + outText.content[0].text);
-        return;
+      const tokenSrc = new vscode.CancellationTokenSource();
+      const timeout = setTimeout(() => {
+        tokenSrc.cancel();
+      }, 60000);
+
+      try {
+        const messages = [
+          new vscode.LanguageModelChatMessage(
+            vscode.LanguageModelChatMessageRole.User,
+            finalPrompt
+          ),
+        ];
+
+        const chatResponse = await model.sendRequest(messages, {}, tokenSrc.token);
+
+        for await (const fragment of chatResponse.text) {
+          response.markdown(fragment);
+        }
+      } catch (err: any) {
+        response.markdown(`\n❌ Error: ${err?.message || String(err)}`);
+      } finally {
+        clearTimeout(timeout);
       }
-
-      if (text.includes("ui")) {
-        const outText = await client.send("tools/call", {
-          name: "getUIComponentInstructions",
-          arguments: {},
-        });
-
-        res.markdown("### 🧩 UI Instructions\n" + outText.content[0].text);
-        return;
-      }
-
-      res.markdown("I can run MCP tools. Try:\n- list tools\n- figma link\n- azure pbi\n- load ui instructions");
     }
   );
 
